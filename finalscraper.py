@@ -156,10 +156,7 @@ def send_telegram_batch(messages, to_log=False):
         if not success:
             print("⚠️ Failed to send a Telegram chunk after retries.")
 
-# ==============================
-# MAIN SCRAPING LOGIC
-# ==============================
-def fetch_products(keyword, retries=6, delay_range=(3, 5), backoff_factor=1.1):
+def fetch_products(keyword, retries=6, delay_range=(1, 2), backoff_factor=1.1):
     url = BASE_URL + quote(keyword)
     products = {}
     session = requests.Session()
@@ -168,9 +165,9 @@ def fetch_products(keyword, retries=6, delay_range=(3, 5), backoff_factor=1.1):
         "accept-encoding": "gzip, deflate, br",
     })
 
-    attempt = 0
-    while attempt < retries:
-        attempt += 1
+    last_error = None  # store last error to report if all retries fail
+
+    for attempt in range(1, retries + 1):
         chosen_proxy = random.choice(PROXY_POOL) if PROXY_POOL else None
         proxies = get_proxy_dict(chosen_proxy) if chosen_proxy else None
 
@@ -194,13 +191,14 @@ def fetch_products(keyword, retries=6, delay_range=(3, 5), backoff_factor=1.1):
             soup = BeautifulSoup(response.text, "html.parser")
             all_cards = soup.select("a._productCard__link_gvf85_7, a[data-testid*='product-card'], a[href*='/product/'], a[data-testid*='productCard']")
 
+            # If parsing failed, retry
             if not all_cards:
-                snippet = response.text[:800].lower()
-                print(f"⚠️ No product cards found for '{keyword}' (Attempt {attempt}). Snippet preview: {snippet[:300]}...")
+                print(f"⚠️ No product cards found for '{keyword}' (Attempt {attempt})")
                 sleep_time = random.uniform(*delay_range) * (backoff_factor ** (attempt - 1))
                 time.sleep(sleep_time)
                 continue
 
+            # Extract products
             for card in all_cards:
                 href = card.get("href")
                 if not href:
@@ -221,29 +219,32 @@ def fetch_products(keyword, retries=6, delay_range=(3, 5), backoff_factor=1.1):
                     "status": "In Stock",
                 }
 
+            # ✅ Success → exit retry loop
             if products:
-                break
+                return products
 
         except (ProxyError, ConnectTimeout, ReadTimeout) as e:
-            err_msg = f"⚠️ Proxy/Timeout error ({keyword}) attempt {attempt}: {e} url:{url} proxy:{chosen_proxy}"
-            print(err_msg)
-            # Instead of sending Telegram immediately, return the error as part of logs to be batched
-            raise
+            last_error = f"⚠️ Proxy/Timeout error ({keyword}) attempt {attempt}: {e} url:{url} proxy:{chosen_proxy}"
+            print(last_error)
 
         except RequestException as e:
-            err_msg = f"⚠️ Requests exception ({keyword}) attempt {attempt}: {e} url:{url}"
-            print(err_msg)
-            raise
+            last_error = f"⚠️ Requests exception ({keyword}) attempt {attempt}: {e} url:{url}"
+            print(last_error)
 
         except Exception as e:
-            err_msg = f"⚠️ Error ({keyword}) attempt {attempt}: {e} url:{url}"
-            print(err_msg)
-            raise
+            last_error = f"⚠️ Error ({keyword}) attempt {attempt}: {e} url:{url}"
+            print(last_error)
 
-    if not products:
-        msg = f"❌ Failed to fetch data for {keyword} after {retries} retries."
-        print(msg)
-    return products
+        # ✅ Only reach here if an error occurred
+        sleep_time = random.uniform(*delay_range) * (backoff_factor ** (attempt - 1))
+        time.sleep(sleep_time)
+
+    # After all retries, if still empty:
+    print(f"❌ Failed to fetch data for {keyword} after {retries} retries.")
+    if last_error:
+        print(f"Last error: {last_error}")
+
+    return products  # empty dict if fail
 
 
 def load_previous_data():
