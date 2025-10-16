@@ -35,25 +35,19 @@ HEADERS = {
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "upgrade-insecure-requests": "1",
-    # user-agent replaced per-request
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                   " (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
 }
 
-# Telegram Bot Config (left as in your original script)
+# Telegram Bot Config
 BOT_TOKEN = "8449824077:AAHlJqCVQiSRlTm8--VxfK-crjNMSVlwXsU"
 CHAT_ID = "-1003062286470"  # Alerts group
 LOG_CHAT_ID = "-1003026899918"  # Logs group
 TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 # ---------- Proxy configuration ----------
-# Recommended: set SCRAPER_PROXY as an environment variable on your server
-# e.g. export SCRAPER_PROXY="http://user:pass@host:port"
 DEFAULT_PROXY = "http://OhovjuoxW47tvp53Cy-res-UK:5N0KkB6uYbP77Pa@gw.thunderproxy.net:5959"
 SCRAPER_PROXY = os.environ.get("SCRAPER_PROXY", DEFAULT_PROXY)
-
-# Support multiple proxies if you later want to use a pool (comma-separated env var)
-# Example: "http://user:pass@host1:port,http://user:pass@host2:port"
 proxy_env_list = os.environ.get("SCRAPER_PROXY_LIST")
 if proxy_env_list:
     PROXY_POOL = [p.strip() for p in proxy_env_list.split(",") if p.strip()]
@@ -65,39 +59,110 @@ def get_proxy_dict(proxy_url):
 
 # ---------- User-Agent rotation ----------
 USER_AGENTS = [
-    # A small curated UA set; extend if needed
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
     "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Mobile Safari/537.36",
 ]
 
+# Telegram message size limit
+TELEGRAM_MAX_CHARS = 4000  # keep margin under 4096
+
 # ==============================
-# FUNCTIONS
+# TELEGRAM HELPERS (BATCHED)
 # ==============================
+def _send_telegram_text(text, chat_id, max_retries=3, timeout=8):
+    """Low-level single send with retry and 429 handling. Returns True if success."""
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(TELEGRAM_URL, data=payload, timeout=timeout)
+        except (ConnectTimeout, ReadTimeout) as e:
+            print(f"⚠️ Telegram network timeout attempt {attempt}: {e}")
+            time.sleep(1 * attempt)
+            continue
+        except Exception as e:
+            print(f"⚠️ Telegram send exception attempt {attempt}: {e}")
+            time.sleep(1 * attempt)
+            continue
 
-def send_telegram_alert(message, to_log=False):
-    """Send message to Telegram group (main alert or log group)."""
-    target_chat = LOG_CHAT_ID if to_log else CHAT_ID
-    payload = {"chat_id": target_chat, "text": message}
-    try:
-        response = requests.post(TELEGRAM_URL, data=payload, timeout=6)
-        if response.status_code != 200:
-            print(f"❌ Telegram send failed ({'LOG' if to_log else 'ALERT'}): {response.text}")
-    except Exception as e:
-        print(f"⚠️ Telegram error ({'LOG' if to_log else 'ALERT'}): {e}")
+        # If Telegram returns 200, all good
+        if resp.status_code == 200:
+            return True
+
+        # Handle 429: Too Many Requests
+        try:
+            j = resp.json()
+        except Exception:
+            j = {}
+
+        if resp.status_code == 429:
+            retry_after = None
+            if isinstance(j, dict):
+                retry_after = j.get("parameters", {}).get("retry_after")
+            if retry_after is None:
+                retry_after = 5  # fallback
+            print(f"⚠️ Telegram 429 rate limit. retry_after={retry_after}s. Sleeping...")
+            time.sleep(int(retry_after) + 1)
+            continue
+
+        # For other non-200 statuses, log and break
+        print(f"❌ Telegram send failed (status {resp.status_code}): {resp.text}")
+        # don't retry on 400-series other than 429
+        return False
+
+    return False
 
 
-def fetch_products(keyword, retries=3, delay_range=(2, 5), backoff_factor=1.5):
+def send_telegram_batch(messages, to_log=False):
     """
-    Fetch product data from Very.co.uk for a given keyword.
-    Uses: Session(), rotating UA, optional rotating residential proxies, retries & backoff.
+    Send a list of messages to Telegram as one or more batched messages.
+    - messages: list[str]
+    - to_log: boolean chooses LOG_CHAT_ID when True, CHAT_ID when False
     """
+    if not messages:
+        return
+
+    chat_id = LOG_CHAT_ID if to_log else CHAT_ID
+
+    # join messages with separator, but keep under TELEGRAM_MAX_CHARS,
+    # otherwise split into multiple sends.
+    out = []
+    current = []
+    current_len = 0
+    for m in messages:
+        part = m.strip()
+        if not part:
+            continue
+        # add a separator between items
+        part_with_sep = part + "\n\n"
+        if current_len + len(part_with_sep) > TELEGRAM_MAX_CHARS:
+            # flush current
+            out.append("".join(current).strip())
+            current = [part_with_sep]
+            current_len = len(part_with_sep)
+        else:
+            current.append(part_with_sep)
+            current_len += len(part_with_sep)
+    if current:
+        out.append("".join(current).strip())
+
+    # Send each chunk with retry/respect for rate limits
+    for chunk in out:
+        # wrap in code block or basic formatting as needed; using HTML safe minimal markup
+        # replace any HTML-sensitive chars if necessary (here we send plain text with parse_mode HTML)
+        safe_chunk = chunk
+        success = _send_telegram_text(safe_chunk, chat_id)
+        if not success:
+            print("⚠️ Failed to send a Telegram chunk after retries.")
+
+# ==============================
+# MAIN SCRAPING LOGIC
+# ==============================
+def fetch_products(keyword, retries=6, delay_range=(3, 5), backoff_factor=1.1):
     url = BASE_URL + quote(keyword)
     products = {}
     session = requests.Session()
-
-    # persist a couple of sensible headers on session
     session.headers.update({
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "accept-encoding": "gzip, deflate, br",
@@ -106,15 +171,12 @@ def fetch_products(keyword, retries=3, delay_range=(2, 5), backoff_factor=1.5):
     attempt = 0
     while attempt < retries:
         attempt += 1
-        # choose a proxy from the pool at random
         chosen_proxy = random.choice(PROXY_POOL) if PROXY_POOL else None
         proxies = get_proxy_dict(chosen_proxy) if chosen_proxy else None
 
-        # rotate user-agent
         ua = random.choice(USER_AGENTS)
         headers = HEADERS.copy()
         headers["user-agent"] = ua
-        # small randomized header tweaks to make fingerprint less uniform
         headers["accept-language"] = random.choice(["en-GB,en;q=0.9", "en-US,en;q=0.9", "en;q=0.8"])
         headers["referer"] = "https://www.google.com/"
 
@@ -122,25 +184,19 @@ def fetch_products(keyword, retries=3, delay_range=(2, 5), backoff_factor=1.5):
             print(f"🌐 Fetching ({attempt}/{retries}) for keyword: {keyword} | UA: {ua.split(' ')[0]} | Proxy: {chosen_proxy or 'none'}")
             response = session.get(url, headers=headers, proxies=proxies, timeout=15)
 
-            # check HTTP status
             if response.status_code != 200:
                 raise Exception(f"HTTP {response.status_code}")
 
             text_lower = response.text.lower()
-            # basic checks for anti-bot signals
             if ("captcha" in text_lower) or ("are you human" in text_lower) or ("verify you are a human" in text_lower):
                 raise Exception("Blocked by CAPTCHA/anti-bot challenge")
 
             soup = BeautifulSoup(response.text, "html.parser")
-            # product card selectors - keep your original selectors but detect multiple common patterns
             all_cards = soup.select("a._productCard__link_gvf85_7, a[data-testid*='product-card'], a[href*='/product/'], a[data-testid*='productCard']")
 
             if not all_cards:
-                # If the page contains visible script placeholders or minimal HTML, it's possible the site uses JS rendering
-                # Print a short snippet for debugging (but don't log huge HTML)
                 snippet = response.text[:800].lower()
                 print(f"⚠️ No product cards found for '{keyword}' (Attempt {attempt}). Snippet preview: {snippet[:300]}...")
-                # wait then retry (maybe proxy/headers)
                 sleep_time = random.uniform(*delay_range) * (backoff_factor ** (attempt - 1))
                 time.sleep(sleep_time)
                 continue
@@ -149,10 +205,8 @@ def fetch_products(keyword, retries=3, delay_range=(2, 5), backoff_factor=1.5):
                 href = card.get("href")
                 if not href:
                     continue
-                # some hrefs might already be absolute
                 link = href if href.startswith("http") else "https://www.very.co.uk" + href
                 titletag = card.find("h3")
-                # price tag detection common patterns
                 pricetag = (card.find("h4", {"data-testid": "fuse-product-card__price__basic"}) or
                             card.find("span", {"data-testid": "product-price"}) or
                             card.select_one(".price, .product-price"))
@@ -167,45 +221,32 @@ def fetch_products(keyword, retries=3, delay_range=(2, 5), backoff_factor=1.5):
                     "status": "In Stock",
                 }
 
-            # success - break out
             if products:
                 break
 
         except (ProxyError, ConnectTimeout, ReadTimeout) as e:
             err_msg = f"⚠️ Proxy/Timeout error ({keyword}) attempt {attempt}: {e} url:{url} proxy:{chosen_proxy}"
             print(err_msg)
-            send_telegram_alert(err_msg, to_log=True)
-            sleep_time = random.uniform(*delay_range) * (backoff_factor ** (attempt - 1))
-            time.sleep(sleep_time)
+            # Instead of sending Telegram immediately, return the error as part of logs to be batched
+            raise
 
         except RequestException as e:
             err_msg = f"⚠️ Requests exception ({keyword}) attempt {attempt}: {e} url:{url}"
             print(err_msg)
-            send_telegram_alert(err_msg, to_log=True)
-            sleep_time = random.uniform(*delay_range) * (backoff_factor ** (attempt - 1))
-            time.sleep(sleep_time)
+            raise
 
         except Exception as e:
             err_msg = f"⚠️ Error ({keyword}) attempt {attempt}: {e} url:{url}"
             print(err_msg)
-            send_telegram_alert(err_msg, to_log=True)
-            # if it's a bot block / captcha, consider waiting longer
-            if "captcha" in str(e).lower() or "blocked" in str(e).lower():
-                time.sleep(10 * attempt)
-            else:
-                sleep_time = random.uniform(*delay_range) * (backoff_factor ** (attempt - 1))
-                time.sleep(sleep_time)
+            raise
 
     if not products:
         msg = f"❌ Failed to fetch data for {keyword} after {retries} retries."
         print(msg)
-        send_telegram_alert(msg, to_log=True)
-
     return products
 
 
 def load_previous_data():
-    """Load product data from CSV if exists."""
     if not os.path.exists(CSV_FILE):
         return {}
     data = {}
@@ -217,7 +258,6 @@ def load_previous_data():
 
 
 def save_to_csv(data):
-    """Save product data to CSV."""
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["keyword", "title", "price", "url", "status"])
         writer.writeheader()
@@ -226,61 +266,82 @@ def save_to_csv(data):
 
 
 def monitor_products():
-    """Main loop for monitoring product availability"""
+    """Main loop for monitoring product availability - batches telegram messages."""
     print("🛍️ Monitoring Very.co.uk for multiple keywords ...\n")
-    send_telegram_alert("🟢 Monitoring started for Very.co.uk tracker.", to_log=True)
 
     previous_data = load_previous_data()
 
     while True:
+        start_time = datetime.utcnow()
+        loop_logs = []    # will be sent to LOG_CHAT_ID
+        loop_alerts = []  # will be sent to ALERT CHAT_ID
+
         current_data = {}
 
+        # For each keyword, attempt fetch and collect logs & alerts (but don't send immediately)
         for keyword in KEYWORDS:
+            # small randomized delay to reduce pattern
+            time.sleep(random.uniform(0.8, 1.8))
             try:
-                # randomize small sleep between keywords to reduce fingerprinting
-                time.sleep(random.uniform(0.8, 2.0))
                 keyword_products = fetch_products(keyword)
                 current_data.update(keyword_products)
-                send_telegram_alert(f"📦 {keyword}: {len(keyword_products)} products found", to_log=True)
+                loop_logs.append(f"📦 {keyword}: {len(keyword_products)} products found")
             except Exception as e:
-                msg = f"⚠️ Error fetching keyword '{keyword}': {e}"
-                print(msg)
-                send_telegram_alert(msg, to_log=True)
+                # Capture the error text and continue; don't spam Telegram immediately
+                err_text = f"⚠️ Error fetching '{keyword}': {str(e)}"
+                print(err_text)
+                loop_logs.append(err_text)
+                # continue to next keyword
+                continue
 
-        # Detect new or changed statuses
+        # Analyze results and build alerts
+        # New or back-in-stock
         for url, info in current_data.items():
             if url not in previous_data:
-                msg = f"🆕 [{info['keyword']}] New product:\n{info['title']} ({info['price']})\n{info['url']}"
-                send_telegram_alert(msg)
+                loop_alerts.append(f"🆕 [{info['keyword']}] New product: {info['title']} ({info['price']})\n{info['url']}")
             elif previous_data[url]["status"] == "Out of Stock":
-                msg = f"✅ [{info['keyword']}] Back in stock:\n{info['title']} ({info['price']})\n{info['url']}"
-                send_telegram_alert(msg)
-
+                loop_alerts.append(f"✅ [{info['keyword']}] Back in stock: {info['title']} ({info['price']})\n{info['url']}")
             current_data[url]["status"] = "In Stock"
 
-        # Detect out of stock
+        # Out of stock detection
         for url, info in previous_data.items():
-            # Only alert if it was previously in stock and now missing
             if url not in current_data and info["status"] == "In Stock":
-                msg = f"❌ [{info['keyword']}] Out of stock:\n{info['title']}\n{info['url']}"
-                send_telegram_alert(msg)
+                loop_alerts.append(f"❌ [{info['keyword']}] Out of stock: {info['title']}\n{info['url']}")
                 info["status"] = "Out of Stock"
-                current_data[url] = info  # keep it in file to avoid repeated alerts
+                current_data[url] = info  # keep it so CSV retains history
 
+        # If no data fetched this loop, add a log entry
         if not current_data:
-            send_telegram_alert("⚠️ No valid data fetched this round (possible block or network issue).", to_log=True)
-            # wait longer before retrying the whole round if nothing fetched
-            time.sleep(30)
-            continue
+            loop_logs.append("⚠️ No valid data fetched this round (possible block or network issue).")
 
+        # Save CSV and update previous_data
         save_to_csv(current_data)
         previous_data = current_data
 
-        round_log = f"🕒 Checked {len(KEYWORDS)} keywords | {len(current_data)} total products tracked"
-        print(round_log)
-        send_telegram_alert(round_log, to_log=True)
+        # Add a summary log (timing and counts)
+        round_log = f"🕒 Round finished | Keywords: {len(KEYWORDS)} | Tracked products: {len(current_data)} | Duration: {(datetime.utcnow() - start_time).seconds}s"
+        loop_logs.insert(0, round_log)
 
-        # main loop delay - keep this reasonable to avoid hammering the site
+        # Send batched messages to Telegram (logs and alerts separately)
+        # Send logs to LOG_CHAT_ID
+        if loop_logs:
+            # limit verbose logs if too many
+            if len(loop_logs) > 50:
+                loop_logs = loop_logs[:50] + [f"...and {len(loop_logs)-50} more log lines omitted."]
+            send_telegram_batch(loop_logs, to_log=True)
+
+        # Send alerts to Alerts chat (stacked)
+        if loop_alerts:
+            # dedupe alerts (optional)
+            deduped_alerts = []
+            seen = set()
+            for a in loop_alerts:
+                if a not in seen:
+                    deduped_alerts.append(a)
+                    seen.add(a)
+            send_telegram_batch(deduped_alerts, to_log=False)
+
+        # Delay before next full loop - keep reasonable
         time.sleep(60)
 
 
@@ -294,4 +355,8 @@ if __name__ == "__main__":
         print("Stopped by user (KeyboardInterrupt).")
     except Exception as e:
         print(f"Fatal error in monitor_products: {e}")
-        send_telegram_alert(f"🔴 Fatal error in scraper: {e}", to_log=True)
+        # Try to send fatal error to logs (use direct minimal send)
+        try:
+            send_telegram_batch([f"🔴 Fatal error in scraper: {e}"], to_log=True)
+        except Exception:
+            pass
